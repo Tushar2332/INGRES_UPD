@@ -53,6 +53,12 @@ const Sidebar = ({ states, language, setLanguage, onStateSelect, activeTab, setA
           >
             🔬 What-If Analysis
           </button>
+          <button
+            className={`state-item ${activeTab === 'diagnostics' ? 'state-item-active' : ''}`}
+            onClick={() => setActiveTab('diagnostics')}
+          >
+            🩺 Groundwater Diagnostics
+          </button>
         </div>
       )}
 
@@ -83,9 +89,9 @@ const Sidebar = ({ states, language, setLanguage, onStateSelect, activeTab, setA
 
       <div className="sidebar-footer">
         <p>💧 Powered by AI</p>
-        <p className="version">v3.0 (Review 2)</p>
+        <p className="version">v4.1 (Diagnostics)</p>
         <p style={{ fontSize: '0.72rem', marginTop: '4px', color: '#9ca3af' }}>
-          INGRES / CGWB · GEC-2022
+          INGRES / CGWB · 2024–2025
         </p>
       </div>
     </div>

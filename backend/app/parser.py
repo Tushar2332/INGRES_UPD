@@ -5,20 +5,23 @@ Pipeline:
   User Query → parse_query() → {intent, locations, is_in_scope, out_of_scope_reason, ...}
 """
 import re
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Union, Iterable
 
-# ─── Assessment year (GEC-2022 standard dataset) ─────────────────────────────
-ASSESSMENT_YEAR = 2022
+# ─── Assessment year (default synced from data_processor at runtime) ─────────
+ASSESSMENT_YEAR = "2024-2025"
 
 # ─── Forecast / future-tense patterns ────────────────────────────────────────
+# Note: Only treat years strictly > 2025 (beyond 2024-2025 cycle) as forecasts,
+# so historical queries like "in 2022" or "in 2020" reach year_unavailable instead.
 FORECAST_PATTERNS = [
     r'\bwill\b', r'\bnext year\b', r'\bfuture\b', r'\bpredict\b',
     r'\bforecast\b', r'\btomorrow\b', r'\bcoming year\b', r'\bupcoming\b',
-    r'\bin 20[2-9]\d\b', r'\bby 20[2-9]\d\b',
-    r'\b202[5-9]\b', r'\b203\d\b', r'\b204\d\b',
+    r'\bin 20(?:2[6-9]|[3-9]\d)\b', r'\bby 20(?:2[6-9]|[3-9]\d)\b',
+    r'\b202[6-9]\b', r'\b203\d\b', r'\b204\d\b',
     r'\bprojection\b', r'\bexpect\b', r'\bwhen will\b', r'\bhow much rain.*come\b',
     # Hindi future markers
-    r'\bhoga\b', r'\bkya hoga\b', r'\bआएगा\b', r'\bहोगा\b', r'\bमिलेगा\b',
+    r'\bhoga\b', r'\bhogi\b', r'\bkya hoga\b', r'\bagle saal\b',
+    r'आएगा', r'होगा', r'होगी', r'मिलेगा', r'अगले साल',
 ]
 
 # ─── Unsupported metric patterns ──────────────────────────────────────────────
@@ -29,27 +32,66 @@ UNSUPPORTED_METRICS = [
     'crop yield', 'agriculture production', 'stock',
 ]
 
-# ─── City / district canonical aliases ────────────────────────────────────────
+# ─── City / district / state canonical aliases (verified against ingres.db) ───
 LOCATION_ALIASES: Dict[str, str] = {
-    'bangalore': 'BENGALURU URBAN',
-    'bengaluru': 'BENGALURU URBAN',
-    'bengalore': 'BENGALURU URBAN',
-    'bangaluru': 'BENGALURU URBAN',
+    'bengaluru urban': 'BENGALURU (URBAN)',
+    'bangalore urban': 'BENGALURU (URBAN)',
+    'bengaluru rural': 'BENGALURU (RURAL)',
+    'bangalore rural': 'BENGALURU (RURAL)',
+    'bangalore': 'BENGALURU (URBAN)',
+    'bengaluru': 'BENGALURU (URBAN)',
+    'bengalore': 'BENGALURU (URBAN)',
+    'bangaluru': 'BENGALURU (URBAN)',
     'mysore': 'MYSURU',
     'maisuru': 'MYSURU',
-    'bombay': 'MUMBAI SUBURBAN',
+    'bombay': 'MUMBAI',
+    'mumbai suburban': 'MUMBAI SUB',
     'madras': 'CHENNAI',
-    'calcutta': 'KOLKATA',
+    'calcutta': 'KOLKATTA',
+    'kolkata': 'KOLKATTA',
+    'howrah': 'HAORA',
+    'hooghly': 'HUGLI',
+    'darjeeling': 'DARJILING',
+    'cooch behar': 'KOCH BIHAR',
     'trivandrum': 'THIRUVANANTHAPURAM',
     'cochin': 'ERNAKULAM',
+    'kochi': 'ERNAKULAM',
+    'calicut': 'KOZHIKKODE',
+    'kozhikode': 'KOZHIKKODE',
+    'kasaragod': 'KASARGOD',
     'baroda': 'VADODARA',
     'poona': 'PUNE',
     'vizag': 'VISAKHAPATNAM',
     'visakha': 'VISAKHAPATNAM',
-    'vizag': 'VISAKHAPATNAM',
-    'new delhi': 'DELHI',
+    'new delhi': 'NEW DELHI',
     'dilli': 'DELHI',
+    'tamil nadu': 'TAMILNADU',
+    'gulbarga': 'KALBURGI',
+    'kalaburagi': 'KALBURGI',
+    'belgaum': 'BELAGAVI',
+    'bellary': 'BALLARI',
+    'bijapur': 'VIJAYAPURA',
+    'shimoga': 'SHIVAMOGGA',
+    'tumkur': 'TUMAKURU',
+    'chikmagalur': 'CHIKKAMAGALURU',
+    'chikkaballapur': 'CHIKKABALLAPURA',
+    'chamarajanagar': 'CHAMARAJANAGARA',
+    'kolar': 'KOLARA',
+    'hubli': 'DHARWAD',
+    'hubballi': 'DHARWAD',
+    'mangalore': 'DAKSHINA KANNADA',
+    'mangaluru': 'DAKSHINA KANNADA',
+    'kanyakumari': 'KANNIYAKUMARI',
+    'trichy': 'TIRUCHIRAPPALLI',
 }
+
+# Qualified location phrases that should not be rewritten by single-word aliases
+_QUALIFIED_LOCATION_PHRASES = (
+    'bengaluru (rural)', 'bengaluru rural', 'bangalore rural',
+    'bengaluru (urban)', 'bengaluru urban', 'bangalore urban',
+    'bengaluru south', 'bangalore south',
+    'mumbai sub', 'mumbai suburban', 'new delhi',
+)
 
 # ─── Intent patterns ─────────────────────────────────────────────────────────
 INTENT_PATTERNS: Dict[str, List[str]] = {
@@ -132,11 +174,17 @@ def extract_year(text: str) -> Optional[int]:
 
 
 def apply_location_aliases(text: str) -> str:
-    """Replace known city aliases with canonical forms for matching."""
+    """Replace known city/state aliases with canonical DB forms using longest-first boundaries."""
     text_lower = text.lower()
-    for alias, canonical in LOCATION_ALIASES.items():
-        if alias in text_lower:
-            text_lower = text_lower.replace(alias, canonical.lower())
+    # Apply longest keys first so qualified phrases like 'bengaluru rural' take priority over 'bengaluru'
+    for alias, canonical in sorted(LOCATION_ALIASES.items(), key=lambda kv: len(kv[0]), reverse=True):
+        # Skip replacing bare 'bengaluru'/'bangalore' when already qualified as rural/south/urban
+        if alias in ('bengaluru', 'bangalore', 'bengalore', 'bangaluru'):
+            if any(q in text_lower for q in _QUALIFIED_LOCATION_PHRASES):
+                continue
+        pattern = r'\b' + re.escape(alias) + r'\b'
+        if re.search(pattern, text_lower):
+            text_lower = re.sub(pattern, canonical.lower(), text_lower)
     return text_lower
 
 
@@ -146,6 +194,50 @@ def normalize_location(name: str) -> str:
     lower = name_clean.lower()
     return LOCATION_ALIASES.get(lower, name_clean.upper())
 
+
+def _extract_available_years(assessment_year: Union[int, str, Iterable[int]]) -> set:
+    """Normalize assessment_year (int, '2024-2025', or iterable) into a set of integer years."""
+    if isinstance(assessment_year, int):
+        return {assessment_year}
+    if isinstance(assessment_year, str):
+        yrs = {int(y) for y in re.findall(r'(19\d{2}|20\d{2})', assessment_year)}
+        return yrs if yrs else {2024, 2025}
+    return {int(y) for y in assessment_year}
+
+
+_NON_LOCATION_TOKENS = {
+    'what', 'which', 'where', 'when', 'how', 'is', 'are', 'was', 'were', 'the', 'a', 'an',
+    'in', 'of', 'for', 'about', 'tell', 'me', 'show', 'give', 'list', 'all', 'states', 'state',
+    'district', 'districts', 'city', 'groundwater', 'ground', 'water', 'data', 'info',
+    'information', 'status', 'category', 'cgwb', 'safe', 'critical', 'semi', 'over', 'exploited',
+    'rainfall', 'rain', 'extraction', 'stage', 'recharge', 'availability', 'net', 'annual',
+    'compare', 'vs', 'versus', 'and', 'or', 'between', 'difference', 'with', 'from', 'to',
+    'reduce', 'increase', 'simulate', 'whatif', 'if', 'we', 'i', 'by', 'more', 'less',
+    'higher', 'lower', 'better', 'worse', 'please', 'find', 'check', 'can', 'you',
+}
+
+
+def _looks_like_unknown_location_query(lower: str, intent: str) -> bool:
+    """
+    Detect when a query explicitly names an unrecognized place
+    (e.g. 'of Atlantis', 'about Wakanda', 'Gotham city groundwater')
+    vs a generic query without a location ('Show rainfall data').
+    """
+    if intent in ('greet', 'ask_state_list'):
+        return False
+    # Check explicit location preposition patterns or '<word> city/district/state'
+    if re.search(r'\b(?:in|of|for|about)\s+[a-z][a-z\-]{2,}\b', lower):
+        for m in re.finditer(r'\b(?:in|of|for|about)\s+([a-z][a-z\-]{2,})\b', lower):
+            tok = m.group(1)
+            if tok not in _NON_LOCATION_TOKENS and not tok.isdigit():
+                return True
+    if re.search(r'\b([a-z][a-z\-]{2,})\s+(?:city|district|state)\b', lower):
+        for m in re.finditer(r'\b([a-z][a-z\-]{2,})\s+(?:city|district|state)\b', lower):
+            if m.group(1) not in _NON_LOCATION_TOKENS:
+                return True
+    # Any remaining non-stopword alpha token of length >= 4
+    tokens = re.findall(r'\b[a-z]{4,}\b', lower)
+    return any(t not in _NON_LOCATION_TOKENS for t in tokens)
 
 
 def detect_intent(text: str) -> str:
@@ -160,7 +252,7 @@ def parse_query(
     text: str,
     available_states: List[str],
     district_map: Dict[str, Any],
-    assessment_year: int = ASSESSMENT_YEAR,
+    assessment_year: Union[int, str, Iterable[int]] = ASSESSMENT_YEAR,
 ) -> Dict[str, Any]:
     """
     Full query parse.
@@ -202,25 +294,42 @@ def parse_query(
 
     # 3. Year extraction + validation
     year_requested = extract_year(lower)
-    year_available = (year_requested is None) or (year_requested == assessment_year)
+    available_years = _extract_available_years(assessment_year)
+    year_available = (year_requested is None) or (year_requested in available_years)
 
     # 4. Intent detection
     intent = detect_intent(lower)
 
-    # 5. Location extraction
+    # 5. Location extraction (word-boundary / exact-first on states and districts)
     found_states: List[str] = []
     found_districts: List[str] = []
 
     for state in available_states:
-        if state.lower() in aliased or state.lower() in lower:
-            found_states.append(state)
+        s_low = state.lower()
+        if re.search(r'\b' + re.escape(s_low) + r'\b', aliased) or re.search(r'\b' + re.escape(s_low) + r'\b', lower):
+            if state not in found_states:
+                found_states.append(state)
 
     for dist_key, (dist_val, state_val) in district_map.items():
-        if dist_key in aliased or dist_key in lower:
+        if not dist_key:
+            continue
+        pat = r'\b' + re.escape(dist_key) + r'\b'
+        if re.search(pat, aliased) or re.search(pat, lower) or (dist_key in aliased and '(' in dist_key):
             if dist_val not in found_districts:
                 found_districts.append(dist_val)
             if state_val not in found_states:
                 found_states.append(state_val)
+
+    # 6. Unknown location check
+    if not found_states and not found_districts and _looks_like_unknown_location_query(lower, intent):
+        return {
+            'intent': intent,
+            'locations': {'states': [], 'districts': []},
+            'is_in_scope': False,
+            'out_of_scope_reason': 'unknown_location',
+            'year_requested': year_requested,
+            'year_available': year_available,
+        }
 
     return {
         'intent': intent,
@@ -274,7 +383,7 @@ def build_scope_refusal(
     if reason == 'year_unavailable':
         return (
             f"⚠️ Data for the year **{year}** is not available in the INGRES dataset.\n"
-            f"The latest available assessment year is **{latest_year}** (GEC-2022)."
+            f"The latest available assessment year is **{latest_year}** (GEC-{latest_year})."
         )
 
     return "⚠️ This query is out of scope for the INGRES groundwater dataset."

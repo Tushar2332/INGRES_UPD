@@ -11,6 +11,7 @@ CGWB Classification:
   Critical      : 90% < stage ≤ 100%
   Over-Exploited: stage > 100%
 """
+import math
 from typing import Dict, Any, Optional
 
 
@@ -53,8 +54,12 @@ def simulate_whatif(
     Returns:
         Full simulation result dict.
     """
-    if annual_extractable <= 0:
+    if not math.isfinite(current_extraction) or current_extraction < 0:
+        raise ValueError("gw_extraction must be a finite non-negative number")
+    if not math.isfinite(annual_extractable) or annual_extractable <= 0:
         raise ValueError("annual_extractable_gw_resource must be > 0 for simulation")
+    if not math.isfinite(pct_change) or pct_change < -100.0:
+        raise ValueError("pct_change must be a finite number >= -100")
 
     # Core calculation
     new_extraction = max(0.0, current_extraction * (1 + pct_change / 100))
@@ -179,3 +184,93 @@ def build_whatif_response(
     )
 
     return "\n".join(lines)
+
+
+def calculate_official_cgwb_metrics(
+    extractable_c_ham: Optional[float],
+    extractable_nc_ham: Optional[float],
+    extractable_pq_ham: Optional[float],
+    extraction_c_ham: Optional[float],
+    extraction_nc_ham: Optional[float],
+    extraction_pq_ham: Optional[float],
+    official_stage_pct: Optional[float],
+    total_extractable_ham: Optional[float] = None,
+    total_extraction_ham: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Compute official CGWB Stage of Extraction and Safe-threshold targets using
+    freshwater Command + Non-Command (C + NC) zones, kept strictly separate from
+    total-extraction What-If simulations.
+
+    Official CGWB methodology excludes Poor Quality (PQ / saline) zones from the
+    overall Stage of Ground Water Extraction (%) denominator/numerator.
+    """
+    extbl_c = extractable_c_ham or 0.0
+    extbl_nc = extractable_nc_ham or 0.0
+    extbl_pq = extractable_pq_ham or 0.0
+
+    extr_c = extraction_c_ham or 0.0
+    extr_nc = extraction_nc_ham or 0.0
+    extr_pq = extraction_pq_ham or 0.0
+
+    fresh_extractable = extbl_c + extbl_nc
+    fresh_extraction = extr_c + extr_nc
+    has_pq_zone = (extbl_pq > 0.0) or (extr_pq > 0.0)
+
+    computed_official_stage: Optional[float] = None
+    if fresh_extractable > 0.0:
+        computed_official_stage = round((fresh_extraction / fresh_extractable) * 100.0, 4)
+
+    reported_stage = round(official_stage_pct, 4) if official_stage_pct is not None else None
+    effective_stage = reported_stage if reported_stage is not None else computed_official_stage
+    official_category = classify_cgwb(effective_stage) if effective_stage is not None else None
+
+    safe_target_extraction_ham: Optional[float] = None
+    required_reduction_ham: Optional[float] = None
+    required_reduction_pct: Optional[float] = None
+
+    if fresh_extractable > 0.0:
+        safe_target_extraction_ham = round((CGWB_SAFE_THRESHOLD / 100.0) * fresh_extractable, 2)
+        if fresh_extraction > safe_target_extraction_ham:
+            red_ham = fresh_extraction - safe_target_extraction_ham
+            required_reduction_ham = round(red_ham, 2)
+            required_reduction_pct = round((red_ham / fresh_extraction) * 100.0, 2) if fresh_extraction > 0 else 0.0
+        else:
+            required_reduction_ham = 0.0
+            required_reduction_pct = 0.0
+
+    total_based_stage: Optional[float] = None
+    if total_extractable_ham and total_extractable_ham > 0 and total_extraction_ham is not None:
+        total_based_stage = round((total_extraction_ham / total_extractable_ham) * 100.0, 4)
+
+    pq_note = None
+    if has_pq_zone:
+        pq_note = (
+            "District includes Poor Quality (PQ) groundwater zones. Official CGWB Stage "
+            "is computed on Freshwater (C + NC) zones only, whereas total-extraction What-If "
+            "uses Total (C + NC + PQ) values."
+        )
+
+    return {
+        "official_basis": "C + NC (Freshwater)",
+        "fresh_extractable_ham": round(fresh_extractable, 2),
+        "fresh_extraction_ham": round(fresh_extraction, 2),
+        "extractable_c_ham": round(extbl_c, 2),
+        "extractable_nc_ham": round(extbl_nc, 2),
+        "extractable_pq_ham": round(extbl_pq, 2),
+        "extraction_c_ham": round(extr_c, 2),
+        "extraction_nc_ham": round(extr_nc, 2),
+        "extraction_pq_ham": round(extr_pq, 2),
+        "has_pq_zone": has_pq_zone,
+        "computed_official_stage_pct": computed_official_stage,
+        "reported_official_stage_pct": reported_stage,
+        "official_category": official_category,
+        "safe_threshold_pct": CGWB_SAFE_THRESHOLD,
+        "safe_target_extraction_ham": safe_target_extraction_ham,
+        "required_reduction_to_safe_ham": required_reduction_ham,
+        "required_reduction_to_safe_pct": required_reduction_pct,
+        "total_extractable_ham": round(total_extractable_ham, 2) if total_extractable_ham is not None else None,
+        "total_extraction_ham": round(total_extraction_ham, 2) if total_extraction_ham is not None else None,
+        "total_based_stage_pct": total_based_stage,
+        "pq_note": pq_note,
+    }

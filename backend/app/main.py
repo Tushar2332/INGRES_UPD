@@ -22,13 +22,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 
-from . import models, schemas, crud
+from . import models, schemas, crud, data_processor
 from .database import engine, get_db
 from .translation import translator
-from .data_processor import load_ingres_data_to_db, ASSESSMENT_YEAR, DATA_SOURCE
+from .data_processor import load_ingres_data_to_db
 from .parser import parse_query, build_scope_refusal, normalize_location, LOCATION_ALIASES
 from .verifier import verify_response
 from .whatif import simulate_whatif, build_whatif_response, classify_cgwb
+from .diagnostics.engine import run_diagnostic, run_multi_scenario_whatif
+from .diagnostics.schemas import (
+    DiagnosticRequest,
+    DiagnosticResponse,
+    MultiScenarioRequest,
+    MultiScenarioResponse,
+)
 from . import evaluate as eval_module
 
 import logging
@@ -66,7 +73,10 @@ async def startup_event():
         xlsx_path = os.path.join(os.path.dirname(__file__), "..", "ingres-data.xlsx")
         xlsx_path = os.path.abspath(xlsx_path)
         count = load_ingres_data_to_db(xlsx_path)
-        logger.info(f"✓ Loaded {count} records from INGRES dataset (year={ASSESSMENT_YEAR})")
+        logger.info(
+            f"✓ Loaded {count} records from INGRES dataset "
+            f"(year={data_processor.ASSESSMENT_YEAR})"
+        )
     except Exception as exc:
         logger.error(f"✗ Error loading data: {exc}")
 
@@ -87,28 +97,47 @@ async def startup_event():
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def normalize_location_name(name: str) -> set:
-    """Generate spelling/alias variations for a location name."""
+    """Generate spelling/alias variations for a DB district name without clobbering siblings."""
     name_lower = name.lower().strip()
     variations = {name_lower}
-    city_variations = {
-        'bangalore':     ['bengaluru', 'bangalore', 'bangaluru', 'bengalore'],
-        'bengaluru':     ['bengaluru', 'bangalore', 'bangaluru', 'bengalore'],
-        'mysore':        ['mysuru', 'mysore', 'maisuru'],
-        'mysuru':        ['mysuru', 'mysore', 'maisuru'],
-        'mumbai':        ['bombay', 'mumbai'],
-        'chennai':       ['madras', 'chennai'],
-        'kolkata':       ['calcutta', 'kolkata'],
-        'thiruvananthapuram': ['trivandrum', 'thiruvananthapuram'],
-        'kochi':         ['cochin', 'kochi'],
-        'vadodara':      ['baroda', 'vadodara'],
-        'pune':          ['poona', 'pune'],
-        'visakhapatnam': ['vizag', 'visakhapatnam', 'visakha'],
-        'delhi':         ['new delhi', 'delhi', 'dilli'],
-        'hyderabad':     ['hyderabad'],
+    exact_district_aliases = {
+        'bengaluru (urban)': ['bengaluru (urban)', 'bengaluru urban', 'bangalore urban', 'bangalore', 'bengaluru'],
+        'bengaluru (rural)': ['bengaluru (rural)', 'bengaluru rural', 'bangalore rural'],
+        'bengaluru south':   ['bengaluru south', 'bangalore south'],
+        'mysuru':            ['mysuru', 'mysore', 'maisuru'],
+        'mumbai':            ['mumbai', 'bombay'],
+        'mumbai sub':        ['mumbai sub', 'mumbai suburban'],
+        'chennai':           ['chennai', 'madras'],
+        'kolkatta':          ['kolkatta', 'kolkata', 'calcutta'],
+        'thiruvananthapuram': ['thiruvananthapuram', 'trivandrum'],
+        'ernakulam':         ['ernakulam', 'cochin', 'kochi'],
+        'kozhikkode':        ['kozhikkode', 'kozhikode', 'calicut'],
+        'kasargod':          ['kasargod', 'kasaragod'],
+        'vadodara':          ['vadodara', 'baroda'],
+        'pune':              ['pune', 'poona'],
+        'visakhapatnam':     ['visakhapatnam', 'vizag', 'visakha'],
+        'new delhi':         ['new delhi', 'dilli'],
+        'kalburgi':          ['kalburgi', 'kalaburagi', 'gulbarga'],
+        'belagavi':          ['belagavi', 'belgaum'],
+        'ballari':           ['ballari', 'bellary'],
+        'vijayapura':        ['vijayapura', 'bijapur'],
+        'shivamogga':        ['shivamogga', 'shimoga'],
+        'tumakuru':          ['tumakuru', 'tumkur'],
+        'chikkamagaluru':    ['chikkamagaluru', 'chikmagalur'],
+        'chikkaballapura':   ['chikkaballapura', 'chikkaballapur'],
+        'chamarajanagara':   ['chamarajanagara', 'chamarajanagar'],
+        'kolara':            ['kolara', 'kolar'],
+        'dharwad':           ['dharwad', 'hubli', 'hubballi'],
+        'dakshina kannada':  ['dakshina kannada', 'mangalore', 'mangaluru'],
+        'haora':             ['haora', 'howrah'],
+        'hugli':             ['hugli', 'hooghly'],
+        'darjiling':         ['darjiling', 'darjeeling'],
+        'koch bihar':        ['koch bihar', 'cooch behar'],
+        'kanniyakumari':     ['kanniyakumari', 'kanyakumari'],
+        'tiruchirappalli':   ['tiruchirappalli', 'trichy'],
     }
-    for key, variants in city_variations.items():
-        if any(v in name_lower for v in variants):
-            variations.update(variants)
+    if name_lower in exact_district_aliases:
+        variations.update(exact_district_aliases[name_lower])
     return variations
 
 
@@ -140,27 +169,29 @@ def _build_district_map(all_data) -> Dict:
 
 
 def _format_records(data_results, include_all: bool = False) -> List[dict]:
-    """Serialise ORM records to dicts with CGWB category."""
+    """Serialise ORM records to dicts with CGWB category, preserving valid 0.0 values."""
     out = []
     limit = 50 if include_all else 15
+    year_str = str(data_processor.ASSESSMENT_YEAR)
+    source_str = data_processor.DATA_SOURCE
     for d in data_results[:limit]:
         stage = d.stage_of_gw_extraction
         cat = classify_cgwb(stage) if stage is not None else None
         out.append({
             "state":            d.state,
             "district":         d.district,
-            "rainfall":         round(d.rainfall_mm, 2)             if d.rainfall_mm             else None,
-            "extraction_stage": round(stage, 2)                      if stage is not None          else None,
-            "gw_recharge":      round(d.ground_water_recharge, 2)   if d.ground_water_recharge   else None,
-            "net_availability": round(d.net_gw_availability, 2)     if d.net_gw_availability     else None,
-            "gw_extraction":    round(d.gw_extraction, 2)           if d.gw_extraction           else None,
+            "rainfall":         round(d.rainfall_mm, 2)                    if d.rainfall_mm is not None                    else None,
+            "extraction_stage": round(stage, 2)                            if stage is not None                            else None,
+            "gw_recharge":      round(d.ground_water_recharge, 2)          if d.ground_water_recharge is not None          else None,
+            "net_availability": round(d.net_gw_availability, 2)            if d.net_gw_availability is not None            else None,
+            "gw_extraction":    round(d.gw_extraction, 2)                  if d.gw_extraction is not None                  else None,
             "annual_extractable": round(d.annual_extractable_gw_resource, 2)
-                                   if d.annual_extractable_gw_resource else None,
+                                   if d.annual_extractable_gw_resource is not None else None,
             "cgwb_category":    cat['category']  if cat else None,
             "cgwb_color":       cat['color']     if cat else None,
             "cgwb_emoji":       cat['emoji']     if cat else None,
-            "assessment_year":  str(ASSESSMENT_YEAR),
-            "data_source":      DATA_SOURCE,
+            "assessment_year":  year_str,
+            "data_source":      source_str,
         })
     return out
 
@@ -202,9 +233,12 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
         dist_map  = _build_district_map(all_data)
         state_map = {s.lower(): s for d in all_data if d.state for s in [d.state]}
 
+        assessment_year_str = str(data_processor.ASSESSMENT_YEAR)
+        data_source_str     = data_processor.DATA_SOURCE
+
         # ── 3. Parse query (scope guard, intent, locations) ──────────────────
         search_text = f"{user_message.lower()} {english_message}"
-        parsed = parse_query(search_text, states, dist_map, ASSESSMENT_YEAR)
+        parsed = parse_query(search_text, states, dist_map, data_processor.ASSESSMENT_YEAR)
 
         logger.info(f"Parsed: intent={parsed['intent']}, in_scope={parsed['is_in_scope']}, "
                     f"locations={parsed['locations']}")
@@ -240,7 +274,8 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
 
             refusal_msg = build_scope_refusal(
                 reason=reason,
-                latest_year=ASSESSMENT_YEAR,
+                location=user_message if reason == 'unknown_location' else '',
+                latest_year=assessment_year_str,
                 latest_value=latest_val,
                 metric=latest_metric,
             )
@@ -255,8 +290,8 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                 response=refusal_msg,
                 scope_status='out_of_scope',
                 out_of_scope_reason=reason,
-                assessment_year=str(ASSESSMENT_YEAR),
-                data_source=DATA_SOURCE,
+                assessment_year=assessment_year_str,
+                data_source=data_source_str,
                 data_confidence=DATA_CONFIDENCE,
                 verified=True,       # refusals are inherently verified
                 verification_issues=[],
@@ -268,7 +303,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
             refusal_msg = build_scope_refusal(
                 reason='year_unavailable',
                 year=yr,
-                latest_year=ASSESSMENT_YEAR,
+                latest_year=assessment_year_str,
             )
             if user_language != 'en':
                 try:
@@ -279,8 +314,8 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                 response=refusal_msg,
                 scope_status='out_of_scope',
                 out_of_scope_reason='year_unavailable',
-                assessment_year=str(ASSESSMENT_YEAR),
-                data_source=DATA_SOURCE,
+                assessment_year=assessment_year_str,
+                data_source=data_source_str,
                 data_confidence=DATA_CONFIDENCE,
                 verified=True,
                 verification_issues=[],
@@ -325,6 +360,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
         suggestions   = []
         chart_data    = None
         cgwb_cat_info = None
+        extra_allowed: List[float] = []
 
         # ── GREET ──
         if final_intent == 'greet':
@@ -336,7 +372,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                 "- ♻️ Groundwater recharge data\n"
                 "- 💦 Net groundwater availability\n"
                 "- 🔬 What-If analysis\n\n"
-                f"All data is from the INGRES/CGWB assessment ({ASSESSMENT_YEAR})."
+                f"All data is from the INGRES/CGWB assessment ({assessment_year_str})."
             )
             suggestions = ['Karnataka', 'Mysore', 'Show all states', 'Punjab groundwater', 'Compare Karnataka and Maharashtra']
 
@@ -354,22 +390,31 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                         else crud.get_data_by_state(db, loc_name))
                 if recs:
                     r = recs[0]
-                    if r.gw_extraction and r.annual_extractable_gw_resource:
+                    if (
+                        r.gw_extraction is not None
+                        and r.annual_extractable_gw_resource is not None
+                        and r.annual_extractable_gw_resource > 0
+                    ):
+                        stage_txt = (
+                            f"{r.stage_of_gw_extraction:.2f}%"
+                            if r.stage_of_gw_extraction is not None
+                            else "N/A"
+                        )
                         bot_response = (
                             f"I found groundwater data for **{r.district}**, {r.state}.\n\n"
                             f"📊 Current Extraction: **{r.gw_extraction:.2f} ham**\n"
-                            f"📐 Current Stage: **{r.stage_of_gw_extraction:.2f}%**\n"
+                            f"📐 Current Stage: **{stage_txt}**\n"
                             f"🏗️ Annual Extractable Resource: **{r.annual_extractable_gw_resource:.2f} ham**\n\n"
                             "To run a What-If simulation, please use the **🔬 What-If Analysis** tab "
                             "in the navigation, or specify a percentage change:\n"
                             "*e.g., 'What if we reduce extraction by 20% in Karnataka?'*"
                         )
                         data_results = [r]
-                        cgwb_cat_info = classify_cgwb(r.stage_of_gw_extraction) if r.stage_of_gw_extraction else None
+                        cgwb_cat_info = classify_cgwb(r.stage_of_gw_extraction) if r.stage_of_gw_extraction is not None else None
                     else:
                         bot_response = (
                             f"⚠️ What-If simulation requires both **GW Extraction** and "
-                            f"**Annual Extractable Resource** data for {loc_name}. "
+                            f"**Annual Extractable Resource** (> 0) data for {loc_name}. "
                             "These values may not be available in the dataset for this location."
                         )
                 else:
@@ -404,11 +449,11 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                         recs = crud.get_data_by_district(db, entity)
                         if recs:
                             d = recs[0]
-                            cat = classify_cgwb(d.stage_of_gw_extraction) if d.stage_of_gw_extraction else None
+                            cat = classify_cgwb(d.stage_of_gw_extraction) if d.stage_of_gw_extraction is not None else None
                             comparison_data.append({
                                 'name': d.district, 'type': 'District',
-                                'rainfall': round(d.rainfall_mm, 2) if d.rainfall_mm else 0,
-                                'extraction': round(d.stage_of_gw_extraction, 2) if d.stage_of_gw_extraction else 0,
+                                'rainfall': round(d.rainfall_mm, 2) if d.rainfall_mm is not None else 0.0,
+                                'extraction': round(d.stage_of_gw_extraction, 2) if d.stage_of_gw_extraction is not None else 0.0,
                                 'state': d.state,
                                 'category': cat['category'] if cat else 'N/A',
                                 'color': cat['color'] if cat else '#888',
@@ -435,6 +480,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                     data_results = crud.get_data_by_state(db, loc)
                     stats = crud.get_statistics(db, loc)
                     if stats:
+                        extra_allowed.append(round(stats['avg_rainfall'], 2))
                         bot_response = (
                             f"🌧️ **Rainfall data for {loc.title()}**\n\n"
                             f"Average rainfall: **{stats['avg_rainfall']:.2f} mm** "
@@ -444,17 +490,20 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                             'type': 'rainfall',
                             'data': [
                                 {'district': d.district.title(), 'rainfall': d.rainfall_mm}
-                                for d in data_results[:15] if d.rainfall_mm
+                                for d in data_results[:15] if d.rainfall_mm is not None
                             ]
                         }
                 else:
                     data_results = crud.get_data_by_district(db, loc)
                     if data_results:
                         d = data_results[0]
-                        bot_response = (
-                            f"🌧️ **Rainfall in {d.district.title()}, {d.state.title()}**\n\n"
-                            f"Rainfall: **{d.rainfall_mm:.2f} mm**"
-                        )
+                        if d.rainfall_mm is not None:
+                            bot_response = (
+                                f"🌧️ **Rainfall in {d.district.title()}, {d.state.title()}**\n\n"
+                                f"Rainfall: **{d.rainfall_mm:.2f} mm**"
+                            )
+                        else:
+                            bot_response = f"Rainfall data not available for {d.district.title()}."
             else:
                 bot_response = "Please specify a location for rainfall data, e.g., 'Rainfall in Karnataka'."
                 suggestions   = ['Karnataka rainfall', 'Mysore rainfall', 'Punjab rainfall']
@@ -474,6 +523,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                     if stats:
                         cat = classify_cgwb(stats['avg_extraction_stage'])
                         cgwb_cat_info = cat
+                        extra_allowed.append(round(stats['avg_extraction_stage'], 2))
                         bot_response = (
                             f"📊 **Groundwater Extraction — {loc.title()}**\n\n"
                             f"Average Stage of Extraction: **{stats['avg_extraction_stage']:.2f}%**\n"
@@ -487,16 +537,16 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                                     'district': d.district.title(),
                                     'extraction': d.stage_of_gw_extraction,
                                     'category': classify_cgwb(d.stage_of_gw_extraction)['category']
-                                               if d.stage_of_gw_extraction else 'N/A',
+                                               if d.stage_of_gw_extraction is not None else 'N/A',
                                 }
-                                for d in data_results[:15] if d.stage_of_gw_extraction
+                                for d in data_results[:15] if d.stage_of_gw_extraction is not None
                             ]
                         }
                 else:
                     data_results = crud.get_data_by_district(db, loc)
                     if data_results:
                         d = data_results[0]
-                        if d.stage_of_gw_extraction:
+                        if d.stage_of_gw_extraction is not None:
                             cat = classify_cgwb(d.stage_of_gw_extraction)
                             cgwb_cat_info = cat
                             bot_response = (
@@ -504,6 +554,8 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                                 f"Stage of Extraction: **{d.stage_of_gw_extraction:.2f}%**\n"
                                 f"CGWB Category: {cat['emoji']} **{cat['category']}**"
                             )
+                        else:
+                            bot_response = f"Extraction stage data not available for {d.district.title()}."
             else:
                 bot_response = "Please specify a location for extraction stage data."
                 suggestions   = ['Karnataka extraction', 'Punjab stage', 'Mysore extraction']
@@ -520,6 +572,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                     data_results = crud.get_data_by_state(db, loc)
                     stats = crud.get_statistics(db, loc)
                     if stats:
+                        extra_allowed.append(round(stats['avg_recharge'], 2))
                         bot_response = (
                             f"♻️ **Groundwater Recharge — {loc.title()}**\n\n"
                             f"Average GW Recharge: **{stats['avg_recharge']:.2f} ham** "
@@ -532,7 +585,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                         bot_response = (
                             f"♻️ **GW Recharge — {d.district.title()}, {d.state.title()}**\n\n"
                             f"Ground Water Recharge: **{d.ground_water_recharge:.2f} ham**"
-                            if d.ground_water_recharge else
+                            if d.ground_water_recharge is not None else
                             f"Recharge data not available for {d.district.title()}."
                         )
             else:
@@ -550,6 +603,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                     data_results = crud.get_data_by_state(db, loc)
                     stats = crud.get_statistics(db, loc)
                     if stats:
+                        extra_allowed.append(round(stats['avg_net_availability'], 2))
                         bot_response = (
                             f"💦 **Net GW Availability — {loc.title()}**\n\n"
                             f"Average Net Availability: **{stats['avg_net_availability']:.2f} ham** "
@@ -562,7 +616,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                         bot_response = (
                             f"💦 **Net GW Availability — {d.district.title()}, {d.state.title()}**\n\n"
                             f"Net Annual GW Availability: **{d.net_gw_availability:.2f} ham**"
-                            if d.net_gw_availability else
+                            if d.net_gw_availability is not None else
                             f"Net availability data not found for {d.district.title()}."
                         )
             else:
@@ -573,22 +627,26 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
             if locations['districts']:
                 matched = locations['districts'][0]
                 data_results = crud.get_data_by_district(db, matched)
+                if data_results and locations['states']:
+                    state_filtered = [r for r in data_results if r.state in locations['states']]
+                    if state_filtered:
+                        data_results = state_filtered
                 if data_results:
                     d = data_results[0]
-                    cat = classify_cgwb(d.stage_of_gw_extraction) if d.stage_of_gw_extraction else None
+                    cat = classify_cgwb(d.stage_of_gw_extraction) if d.stage_of_gw_extraction is not None else None
                     cgwb_cat_info = cat
 
                     details = []
-                    if d.rainfall_mm:
+                    if d.rainfall_mm is not None:
                         details.append(f"🌧️ Rainfall: **{d.rainfall_mm:.2f} mm**")
-                    if d.stage_of_gw_extraction:
+                    if d.stage_of_gw_extraction is not None:
                         details.append(
                             f"📊 Extraction Stage: **{d.stage_of_gw_extraction:.2f}%** "
                             f"({cat['emoji']} {cat['category']})"
                         )
-                    if d.ground_water_recharge:
+                    if d.ground_water_recharge is not None:
                         details.append(f"♻️ GW Recharge: **{d.ground_water_recharge:.2f} ham**")
-                    if d.net_gw_availability:
+                    if d.net_gw_availability is not None:
                         details.append(f"💦 Net Availability: **{d.net_gw_availability:.2f} ham**")
 
                     bot_response = (
@@ -605,9 +663,9 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                                 'district': rec.district.title(),
                                 'extraction': rec.stage_of_gw_extraction,
                                 'category': classify_cgwb(rec.stage_of_gw_extraction)['category']
-                                            if rec.stage_of_gw_extraction else 'N/A',
+                                            if rec.stage_of_gw_extraction is not None else 'N/A',
                             }
-                            for rec in all_state_data[:15] if rec.stage_of_gw_extraction
+                            for rec in all_state_data[:15] if rec.stage_of_gw_extraction is not None
                         ]
                     }
 
@@ -629,6 +687,12 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                     cat = classify_cgwb(stats['avg_extraction_stage'])
                     cgwb_cat_info = cat
                     dist_counts = crud.get_cgwb_distribution(db, matched)
+                    extra_allowed.extend([
+                        round(stats['avg_rainfall'], 2),
+                        round(stats['avg_extraction_stage'], 2),
+                        round(stats['avg_recharge'], 2),
+                        round(stats['avg_net_availability'], 2),
+                    ])
 
                     bot_response = (
                         f"🗺️ **Groundwater Data — {matched.title()}**\n\n"
@@ -650,16 +714,16 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                         'type': 'state_overview',
                         'rainfall_data': [
                             {'district': d.district.title(), 'rainfall': d.rainfall_mm}
-                            for d in data_results[:15] if d.rainfall_mm
+                            for d in data_results[:15] if d.rainfall_mm is not None
                         ],
                         'extraction_data': [
                             {
                                 'district': d.district.title(),
                                 'extraction': d.stage_of_gw_extraction,
                                 'category': classify_cgwb(d.stage_of_gw_extraction)['category']
-                                            if d.stage_of_gw_extraction else 'N/A',
+                                            if d.stage_of_gw_extraction is not None else 'N/A',
                             }
-                            for d in data_results[:15] if d.stage_of_gw_extraction
+                            for d in data_results[:15] if d.stage_of_gw_extraction is not None
                         ],
                         'cgwb_distribution': [
                             {'name': k, 'value': v, 'color': classify_cgwb(
@@ -683,7 +747,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
 
         # ── 9. Number Verification ───────────────────────────────────────────
         formatted_data = _format_records(data_results)
-        verification   = verify_response(bot_response, formatted_data)
+        verification   = verify_response(bot_response, formatted_data, extra_allowed=extra_allowed or None)
         verified       = verification['verified']
         v_issues       = verification['issues']
 
@@ -711,8 +775,8 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
             verification_issues=v_issues if not verified else [],
             scope_status='in_scope',
             out_of_scope_reason=None,
-            assessment_year=str(ASSESSMENT_YEAR),
-            data_source=DATA_SOURCE,
+            assessment_year=assessment_year_str,
+            data_source=data_source_str,
             data_confidence=DATA_CONFIDENCE,
             cgwb_category=cgwb_cat_info['category'] if cgwb_cat_info else None,
             cgwb_color=cgwb_cat_info['color']    if cgwb_cat_info else None,
@@ -729,19 +793,31 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
 async def run_whatif(req: schemas.WhatIfRequest, db: Session = Depends(get_db)):
     """Run a What-If simulation for a specific district's groundwater extraction."""
     try:
-        record = crud.get_data_for_whatif(db, req.state, req.district)
+        record, ambiguous = crud.get_whatif_lookup_result(db, req.state, req.district)
+        if ambiguous:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Ambiguous district '{req.district}' in state '{req.state}'. "
+                    f"Matching districts: {', '.join(ambiguous)}"
+                )
+            )
         if not record:
             raise HTTPException(
                 status_code=404,
                 detail=f"No data found for district '{req.district}' in state '{req.state}'"
             )
 
-        if not record.gw_extraction or not record.annual_extractable_gw_resource:
+        if (
+            record.gw_extraction is None
+            or record.annual_extractable_gw_resource is None
+            or record.annual_extractable_gw_resource <= 0
+        ):
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"What-If requires 'gw_extraction' and 'annual_extractable_gw_resource' "
-                    f"for {record.district}. These values may be missing in the dataset."
+                    f"What-If requires non-null 'gw_extraction' and positive 'annual_extractable_gw_resource' "
+                    f"for {record.district}. These values may be missing or zero in the dataset."
                 )
             )
 
@@ -761,8 +837,8 @@ async def run_whatif(req: schemas.WhatIfRequest, db: Session = Depends(get_db)):
             response=response_text,
             result=result,
             chart_data=result['chart_data'],
-            assessment_year=str(ASSESSMENT_YEAR),
-            data_source=DATA_SOURCE,
+            assessment_year=str(data_processor.ASSESSMENT_YEAR),
+            data_source=data_processor.DATA_SOURCE,
             district=record.district,
             state=record.state,
         )
@@ -771,6 +847,42 @@ async def run_whatif(req: schemas.WhatIfRequest, db: Session = Depends(get_db)):
         raise
     except Exception as exc:
         logger.error(f"What-If error: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/whatif/scenarios", response_model=MultiScenarioResponse)
+async def run_whatif_scenarios(req: MultiScenarioRequest, db: Session = Depends(get_db)):
+    """Run multi-sector What-If scenario comparison with C+NC official stage separation."""
+    try:
+        return run_multi_scenario_whatif(db, req)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        msg = str(exc)
+        if msg.startswith("AMBIGUOUS:"):
+            raise HTTPException(status_code=422, detail=msg.replace("AMBIGUOUS:", "", 1))
+        raise HTTPException(status_code=422, detail=msg)
+    except Exception as exc:
+        logger.error(f"What-If scenarios error: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ─── Groundwater Diagnostic Endpoint ──────────────────────────────────────────
+
+@app.post("/diagnose", response_model=DiagnosticResponse)
+async def diagnose_groundwater(req: DiagnosticRequest, db: Session = Depends(get_db)):
+    """Run evidence-based groundwater stress diagnosis and intervention analysis."""
+    try:
+        return run_diagnostic(db, req)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        msg = str(exc)
+        if msg.startswith("AMBIGUOUS:"):
+            raise HTTPException(status_code=422, detail=msg.replace("AMBIGUOUS:", "", 1))
+        raise HTTPException(status_code=422, detail=msg)
+    except Exception as exc:
+        logger.error(f"Diagnostic error: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -809,15 +921,6 @@ def get_state_data(state: str, db: Session = Depends(get_db)):
     return _format_records(data, include_all=True)
 
 
-@app.get("/stats/{state}")
-def get_state_stats(state: str, db: Session = Depends(get_db)):
-    stats = crud.get_statistics(db, state)
-    if not stats:
-        raise HTTPException(status_code=404, detail="State not found")
-    cat = classify_cgwb(stats['avg_extraction_stage'])
-    return {**stats, 'cgwb_category': cat['category'], 'cgwb_color': cat['color']}
-
-
 @app.get("/stats/total")
 def get_total_stats(db: Session = Depends(get_db)):
     total_records   = db.query(models.GroundwaterData).count()
@@ -828,9 +931,18 @@ def get_total_stats(db: Session = Depends(get_db)):
         "total_states":    total_states,
         "total_districts": total_districts,
         "rasa_enabled":    USE_RASA,
-        "assessment_year": ASSESSMENT_YEAR,
-        "data_source":     DATA_SOURCE,
+        "assessment_year": data_processor.ASSESSMENT_YEAR,
+        "data_source":     data_processor.DATA_SOURCE,
     }
+
+
+@app.get("/stats/{state}")
+def get_state_stats(state: str, db: Session = Depends(get_db)):
+    stats = crud.get_statistics(db, state)
+    if not stats:
+        raise HTTPException(status_code=404, detail="State not found")
+    cat = classify_cgwb(stats['avg_extraction_stage'])
+    return {**stats, 'cgwb_category': cat['category'], 'cgwb_color': cat['color']}
 
 
 @app.get("/cgwb/{state}")
@@ -861,8 +973,8 @@ def get_cgwb_distribution(state: str, db: Session = Depends(get_db)):
 def get_assessment_year():
     """Return the assessment year and data source for the loaded dataset."""
     return {
-        "assessment_year": ASSESSMENT_YEAR,
-        "data_source":     DATA_SOURCE,
+        "assessment_year": data_processor.ASSESSMENT_YEAR,
+        "data_source":     data_processor.DATA_SOURCE,
         "data_confidence": DATA_CONFIDENCE,
     }
 
@@ -873,10 +985,11 @@ def health_check():
         "status":       "healthy",
         "version":      "4.0 (Review 2)",
         "rasa_enabled": USE_RASA,
-        "assessment_year": ASSESSMENT_YEAR,
+        "assessment_year": data_processor.ASSESSMENT_YEAR,
         "features": [
             "scope_guard", "number_verifier", "whatif_simulator",
-            "cgwb_classification", "benchmark_evaluation"
+            "cgwb_classification", "benchmark_evaluation",
+            "groundwater_diagnostics", "multisector_whatif"
         ]
     }
 
