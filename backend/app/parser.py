@@ -24,12 +24,11 @@ FORECAST_PATTERNS = [
     r'आएगा', r'होगा', r'होगी', r'मिलेगा', r'अगले साल',
 ]
 
-# ─── Unsupported metric patterns ──────────────────────────────────────────────
+# ─── Unsupported metric / unrelated scope patterns ────────────────────────────
 UNSUPPORTED_METRICS = [
     'temperature', 'flood risk', 'air quality', 'pollution', 'population',
-    'crime', 'gdp', 'economy', 'climate change', 'drought index',
-    'soil moisture', 'humidity', 'wind speed', 'evaporation',
-    'crop yield', 'agriculture production', 'stock',
+    'crime', 'gdp', 'economy', 'stock', 'cricket', 'movie', 'recipe',
+    'humidity', 'wind speed',
 ]
 
 # ─── City / district / state canonical aliases (verified against ingres.db) ───
@@ -93,7 +92,65 @@ _QUALIFIED_LOCATION_PHRASES = (
     'mumbai sub', 'mumbai suburban', 'new delhi',
 )
 
-# ─── Intent patterns ─────────────────────────────────────────────────────────
+# ─── Known crop names & synonyms for agricultural intent parsing ───────────
+CROP_SYNONYMS: Dict[str, str] = {
+    'mangoes': 'mango',
+    'mango': 'mango',
+    'paddy': 'rice',
+    'rice': 'rice',
+    'sugarcane': 'sugarcane',
+    'cane': 'sugarcane',
+    'wheat': 'wheat',
+    'maize': 'maize',
+    'corn': 'maize',
+    'cotton': 'cotton',
+    'millets': 'millets',
+    'millet': 'millets',
+    'ragi': 'millets',
+    'jowar': 'millets',
+    'bajra': 'millets',
+    'pulses': 'pulses',
+    'pulse': 'pulses',
+    'lentils': 'pulses',
+    'chickpea': 'pulses',
+    'gram': 'pulses',
+    'tur': 'pulses',
+    'groundnut': 'groundnut',
+    'peanut': 'groundnut',
+    'banana': 'banana',
+    'bananas': 'banana',
+    'coconut': 'coconut',
+    'arecanut': 'arecanut',
+    'coffee': 'coffee',
+    'vegetables': 'vegetables',
+    'vegetable': 'vegetables',
+    'tomato': 'vegetables',
+    'onion': 'vegetables',
+    'potato': 'vegetables',
+}
+
+# ─── Contextual reference phrases ─────────────────────────────────────────────
+CONTEXT_LOCATION_PATTERNS = [
+    r'\bthere\b',
+    r'\bhere\b',
+    r'\bthis district\b',
+    r'\bthis state\b',
+    r'\bthis area\b',
+    r'\bthis region\b',
+    r'\bthis location\b',
+    r'\bthis place\b',
+    r'\bsame district\b',
+    r'\bsame area\b',
+    r'\bthat district\b',
+    r'\bthat area\b',
+    r'\bwhat about\b',
+    r'\bhow about\b',
+    r'\bwould\b.*\bbe better\b',
+    r'\bis it sustainable\b',
+    r'\bis it suitable\b',
+]
+
+# ─── Intent patterns (order matters: specific advisory intents before generic) ─
 INTENT_PATTERNS: Dict[str, List[str]] = {
     'greet': [
         r'\bhello\b', r'\bhi\b', r'\bhey\b', r'\bnamaste\b', r'\bnamaskar\b',
@@ -103,6 +160,53 @@ INTENT_PATTERNS: Dict[str, List[str]] = {
     'ask_state_list': [
         r'\bshow states\b', r'\blist states\b', r'\ball states\b',
         r'\bavailable states\b', r'\bwhich states\b', r'\bshow all\b',
+    ],
+    'ask_crop_water_requirements': [
+        r'\bwhich crops?\b.*\b(less|low|minimal|little|more|high)\s+water\b',
+        r'\blow[- ]water crops?\b', r'\bless[- ]water crops?\b', r'\bdrought[- ]tolerant crops?\b',
+        r'\bcrop water requirement', r'\bwater requirement.*\bcrop',
+        r'\bhow much water does\b.*\bneed\b', r'\bwater[- ]intensive crops?\b',
+    ],
+    'ask_agricultural_suitability': [
+        r'\b(?:grow|cultivat\w*|plant|farm\w*|crop\w*|orchard|horticultur\w*)\b',
+        r'\b(?:suitable|good|viable|feasible|better)\b.*\b(?:crop|crops|grow|cultivat|mango|mangoes|rice|paddy|wheat|sugarcane|cotton|millet|millets|pulses|banana|coconut|maize|groundnut|vegetables?)\b',
+        r'\bwhat about\b.*\b(?:mango|mangoes|rice|paddy|wheat|sugarcane|cotton|millet|millets|pulses|banana|coconut|maize|groundnut|vegetables?)\b',
+        r'\bwould\b.*\b(?:mango|mangoes|rice|paddy|wheat|sugarcane|cotton|millet|millets|pulses|banana|coconut|maize|groundnut|vegetables?)\b.*\bbetter\b',
+        r'\b(?:mango|mangoes|rice|paddy|wheat|sugarcane|cotton|millet|millets|pulses|banana|coconut|maize|groundnut|vegetables?)\b',
+    ],
+    'ask_irrigation_impact': [
+        r'\b(?:increas\w*|expand\w*|more|excessive|heavy)\b.*\birrigat\w*\b',
+        r'\birrigat\w*\b.*\b(?:pressure|stress|impact|effect|deplet\w*|groundwater|sustainab\w*)\b',
+        r'\bwhat if\b.*\birrigat\w*\b',
+        r'\b(?:drip|sprinkler|micro[- ]irrigat\w*|flood irrigat\w*|irrigat\w* efficiency|irrigat\w* scheduling)\b',
+        r'\bpressure on groundwater\b',
+    ],
+    'ask_sustainability': [
+        r'\bsustainab\w*\b', r'\blong[- ]term\b.*\b(?:water|groundwater|farming|extraction)\b',
+        r'\bcan it support\b', r'\bsafe to pump\b',
+    ],
+    'ask_trends_causes': [
+        r'\bwhy is\b.*\b(?:over[- ]?exploit\w*|critical|stressed|high|low|deplet\w*)\b',
+        r'\b(?:causes?|reasons?|drivers?|trends?)\b.*\b(?:groundwater|extraction|stress|deplet\w*|decline)\b',
+        r'\bgroundwater trends?\b',
+    ],
+    'ask_general_groundwater': [
+        r'\bwhat does\b.*\bmean\b', r'\bmeaning of\b', r'\bhow is\b.*\bcalculated\b',
+        r'\bexplain\b.*\b(?:cgwb|stage|groundwater|recharge|extraction|safe|over.exploit)\b',
+        r'\bwhat are the cgwb categor',
+    ],
+    'ask_whatif': [
+        r'\bwhat.if\b', r'\bwhat if\b',
+        r'\bif (?:i |we )?reduce\b', r'\bif (?:i |we )?increase\b',
+        r'\bif extraction\b', r'\bsimulat\b', r'\bscenario\b',
+        r'\bwhat happens\b', r'\bif we\b', r'\bif the\b.*\bextraction\b',
+        r'\bक्या होगा\b', r'\breduce extraction\b', r'\bincrease extraction\b',
+        r'\bchange extraction\b',
+    ],
+    'compare': [
+        r'\bcompare\b', r'\bvs\.?\b', r'\bversus\b', r'\bdifference between\b',
+        r'\btulna\b', r'\bतुलना\b', r'\bwhich is (better|worse|higher|lower)\b',
+        r'\bbetween\b.*\band\b',
     ],
     'ask_rainfall': [
         r'\brainfall\b', r'\brain\b', r'\bprecipitation\b', r'\bbarish\b',
@@ -120,19 +224,6 @@ INTENT_PATTERNS: Dict[str, List[str]] = {
     'ask_availability': [
         r'\bavailability\b', r'\bnet availability\b', r'\bfuture use\b',
         r'\bउपलब्धता\b', r'\bnet annual\b', r'\bremaining\b',
-    ],
-    'compare': [
-        r'\bcompare\b', r'\bvs\.?\b', r'\bversus\b', r'\bdifference between\b',
-        r'\btulna\b', r'\bतुलना\b', r'\bwhich is (better|worse|higher|lower)\b',
-        r'\bbetween\b.*\band\b',
-    ],
-    'ask_whatif': [
-        r'\bwhat.if\b', r'\bwhat if\b',
-        r'\bif (?:i |we )?reduce\b', r'\bif (?:i |we )?increase\b',
-        r'\bif extraction\b', r'\bsimulat\b', r'\bscenario\b',
-        r'\bwhat happens\b', r'\bif we\b', r'\bif the\b.*\bextraction\b',
-        r'\bक्या होगा\b', r'\breduce extraction\b', r'\bincrease extraction\b',
-        r'\bchange extraction\b',
     ],
     'ask_category': [
         r'\bcategory\b', r'\bcgwb\b', r'\bsafe\b', r'\bcritical\b',
@@ -212,32 +303,69 @@ _NON_LOCATION_TOKENS = {
     'information', 'status', 'category', 'cgwb', 'safe', 'critical', 'semi', 'over', 'exploited',
     'rainfall', 'rain', 'extraction', 'stage', 'recharge', 'availability', 'net', 'annual',
     'compare', 'vs', 'versus', 'and', 'or', 'between', 'difference', 'with', 'from', 'to',
-    'reduce', 'increase', 'simulate', 'whatif', 'if', 'we', 'i', 'by', 'more', 'less',
-    'higher', 'lower', 'better', 'worse', 'please', 'find', 'check', 'can', 'you',
+    'reduce', 'increase', 'increasing', 'decreasing', 'simulate', 'whatif', 'if', 'we', 'i',
+    'by', 'more', 'less', 'higher', 'lower', 'better', 'worse', 'please', 'find', 'check',
+    'can', 'you', 'good', 'grow', 'growing', 'cultivate', 'cultivation', 'suitable', 'suitability',
+    'viable', 'crop', 'crops', 'there', 'here', 'this', 'that', 'same', 'area', 'region',
+    'place', 'farm', 'farming', 'agriculture', 'agricultural', 'irrigation', 'irrigated',
+    'sustainable', 'sustainability', 'pressure', 'stress', 'require', 'requires', 'need', 'needs',
+    'would', 'could', 'should', 'will', 'does', 'do', 'put', 'mean', 'means', 'explain',
+    'trend', 'trends', 'cause', 'causes', 'reason', 'reasons', 'why', 'soil', 'drainage',
+    'climate', 'drip', 'sprinkler', 'well', 'wells', 'borewell', 'borewells', 'pump', 'pumps',
+    'mango', 'mangoes', 'rice', 'paddy', 'wheat', 'sugarcane', 'maize', 'cotton', 'millet',
+    'millets', 'pulses', 'groundnut', 'banana', 'coconut', 'arecanut', 'coffee', 'vegetables',
+}
+
+_LOCATION_LOOKUP_INTENTS = {
+    'ask_groundwater', 'ask_rainfall', 'ask_extraction', 'ask_recharge',
+    'ask_availability', 'ask_category', 'compare',
 }
 
 
-def _looks_like_unknown_location_query(lower: str, intent: str) -> bool:
+def extract_crop(text: str) -> Optional[str]:
+    """Extract canonical crop name from text if mentioned (known or '<grow|cultivate> <crop>')."""
+    lower = text.lower()
+    for term, canonical in sorted(CROP_SYNONYMS.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if re.search(r'\b' + re.escape(term) + r'\b', lower):
+            return canonical
+    m = re.search(r'\b(?:grow|cultivate|cultivating|growing|plant|planting)\s+([a-z]{3,20})\b', lower)
+    if m and m.group(1) not in _NON_LOCATION_TOKENS:
+        return m.group(1)
+    return None
+
+
+def uses_context_reference(text: str) -> bool:
+    """Return True if the message refers to a previously discussed location/topic."""
+    return _match_patterns(text, CONTEXT_LOCATION_PATTERNS)
+
+
+def extract_unknown_location_candidate(original_text: str, lower: str, intent: str) -> Optional[str]:
     """
-    Detect when a query explicitly names an unrecognized place
-    (e.g. 'of Atlantis', 'about Wakanda', 'Gotham city groundwater')
-    vs a generic query without a location ('Show rainfall data').
+    Extract a plausible unrecognized place name ONLY for location-lookup queries,
+    never returning an entire natural-language sentence.
     """
-    if intent in ('greet', 'ask_state_list'):
-        return False
-    # Check explicit location preposition patterns or '<word> city/district/state'
-    if re.search(r'\b(?:in|of|for|about)\s+[a-z][a-z\-]{2,}\b', lower):
-        for m in re.finditer(r'\b(?:in|of|for|about)\s+([a-z][a-z\-]{2,})\b', lower):
-            tok = m.group(1)
-            if tok not in _NON_LOCATION_TOKENS and not tok.isdigit():
-                return True
-    if re.search(r'\b([a-z][a-z\-]{2,})\s+(?:city|district|state)\b', lower):
-        for m in re.finditer(r'\b([a-z][a-z\-]{2,})\s+(?:city|district|state)\b', lower):
-            if m.group(1) not in _NON_LOCATION_TOKENS:
-                return True
-    # Any remaining non-stopword alpha token of length >= 4
-    tokens = re.findall(r'\b[a-z]{4,}\b', lower)
-    return any(t not in _NON_LOCATION_TOKENS for t in tokens)
+    if intent not in _LOCATION_LOOKUP_INTENTS:
+        return None
+    if uses_context_reference(lower):
+        return None
+
+    # 1. Explicit '<word> city/district/state'
+    m = re.search(r'\b([a-z][a-z\-]{2,})\s+(?:city|district|state)\b', lower)
+    if m and m.group(1) not in _NON_LOCATION_TOKENS:
+        return m.group(1).title()
+
+    # 2. Explicit preposition '<in|of|for|about> <Candidate>'
+    for m in re.finditer(r'\b(?:in|of|for|about)\s+([a-z][a-z\-]{2,})\b', lower):
+        tok = m.group(1)
+        if tok not in _NON_LOCATION_TOKENS and not tok.isdigit():
+            return tok.title()
+
+    # 3. Any remaining non-stopword capitalized/alpha token
+    for tok in re.findall(r'\b[a-z]{4,}\b', lower):
+        if tok not in _NON_LOCATION_TOKENS:
+            return tok.title()
+
+    return None
 
 
 def detect_intent(text: str) -> str:
@@ -253,6 +381,7 @@ def parse_query(
     available_states: List[str],
     district_map: Dict[str, Any],
     assessment_year: Union[int, str, Iterable[int]] = ASSESSMENT_YEAR,
+    original_text: str = '',
 ) -> Dict[str, Any]:
     """
     Full query parse.
@@ -261,6 +390,9 @@ def parse_query(
         {
             intent: str,
             locations: {states: List[str], districts: List[str]},
+            crop: str | None,
+            uses_context: bool,
+            unknown_location_candidate: str | None,
             is_in_scope: bool,
             out_of_scope_reason: str | None,
             year_requested: int | None,
@@ -269,23 +401,31 @@ def parse_query(
     """
     lower = text.lower()
     aliased = apply_location_aliases(lower)
+    crop = extract_crop(lower)
+    uses_ctx = uses_context_reference(lower)
 
     # 1. Forecast check — highest priority
     if is_forecast_query(lower):
         return {
             'intent': 'forecast',
             'locations': {'states': [], 'districts': []},
+            'crop': crop,
+            'uses_context': uses_ctx,
+            'unknown_location_candidate': None,
             'is_in_scope': False,
             'out_of_scope_reason': 'forecast',
             'year_requested': None,
             'year_available': True,
         }
 
-    # 2. Unsupported metric
+    # 2. Unsupported metric / unrelated topic
     if has_unsupported_metric(lower):
         return {
             'intent': 'unsupported_metric',
             'locations': {'states': [], 'districts': []},
+            'crop': crop,
+            'uses_context': uses_ctx,
+            'unknown_location_candidate': None,
             'is_in_scope': False,
             'out_of_scope_reason': 'unsupported_metric',
             'year_requested': None,
@@ -320,20 +460,29 @@ def parse_query(
             if state_val not in found_states:
                 found_states.append(state_val)
 
-    # 6. Unknown location check
-    if not found_states and not found_districts and _looks_like_unknown_location_query(lower, intent):
-        return {
-            'intent': intent,
-            'locations': {'states': [], 'districts': []},
-            'is_in_scope': False,
-            'out_of_scope_reason': 'unknown_location',
-            'year_requested': year_requested,
-            'year_available': year_available,
-        }
+    # 6. Unknown location check (ONLY for location-lookup queries with an explicit place candidate)
+    unknown_candidate = None
+    if not found_states and not found_districts:
+        unknown_candidate = extract_unknown_location_candidate(original_text or text, lower, intent)
+        if unknown_candidate:
+            return {
+                'intent': intent,
+                'locations': {'states': [], 'districts': []},
+                'crop': crop,
+                'uses_context': uses_ctx,
+                'unknown_location_candidate': unknown_candidate,
+                'is_in_scope': False,
+                'out_of_scope_reason': 'unknown_location',
+                'year_requested': year_requested,
+                'year_available': year_available,
+            }
 
     return {
         'intent': intent,
         'locations': {'states': found_states, 'districts': found_districts},
+        'crop': crop,
+        'uses_context': uses_ctx,
+        'unknown_location_candidate': None,
         'is_in_scope': True,
         'out_of_scope_reason': None,
         'year_requested': year_requested,

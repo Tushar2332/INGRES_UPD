@@ -29,6 +29,7 @@ from .data_processor import load_ingres_data_to_db
 from .parser import parse_query, build_scope_refusal, normalize_location, LOCATION_ALIASES
 from .verifier import verify_response
 from .whatif import simulate_whatif, build_whatif_response, classify_cgwb
+from . import chat_advisor
 from .diagnostics.engine import run_diagnostic, run_multi_scenario_whatif
 from .diagnostics.schemas import (
     DiagnosticRequest,
@@ -63,6 +64,9 @@ USE_RASA = os.environ.get("USE_RASA", "false").lower() == "true"
 
 # Data confidence tag
 DATA_CONFIDENCE = "Latest Available Assessment"
+
+# Bounded server-side conversation context per session_id (clears oldest if > 500 sessions)
+_SESSION_CONTEXT: Dict[str, Dict[str, Any]] = {}
 
 
 # ─── Startup ─────────────────────────────────────────────────────────────────
@@ -236,12 +240,25 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
         assessment_year_str = str(data_processor.ASSESSMENT_YEAR)
         data_source_str     = data_processor.DATA_SOURCE
 
+        # ── 2b. Resolve previous conversation context ────────────────────────
+        prev_context: Dict[str, Any] = {}
+        if message.session_id and message.session_id in _SESSION_CONTEXT:
+            prev_context = dict(_SESSION_CONTEXT[message.session_id])
+        if message.context:
+            prev_context = {**prev_context, **message.context}
+
         # ── 3. Parse query (scope guard, intent, locations) ──────────────────
         search_text = f"{user_message.lower()} {english_message}"
-        parsed = parse_query(search_text, states, dist_map, data_processor.ASSESSMENT_YEAR)
+        parsed = parse_query(
+            search_text,
+            states,
+            dist_map,
+            data_processor.ASSESSMENT_YEAR,
+            original_text=user_message,
+        )
 
         logger.info(f"Parsed: intent={parsed['intent']}, in_scope={parsed['is_in_scope']}, "
-                    f"locations={parsed['locations']}")
+                    f"locations={parsed['locations']}, crop={parsed.get('crop')}, uses_ctx={parsed.get('uses_context')}")
 
         # ── 4. Scope Guard — handle out-of-scope queries first ───────────────
         if not parsed['is_in_scope']:
@@ -274,7 +291,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
 
             refusal_msg = build_scope_refusal(
                 reason=reason,
-                location=user_message if reason == 'unknown_location' else '',
+                location=(parsed.get('unknown_location_candidate') or user_message) if reason == 'unknown_location' else '',
                 latest_year=assessment_year_str,
                 latest_value=latest_val,
                 metric=latest_metric,
@@ -288,6 +305,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
 
             return schemas.ChatResponse(
                 response=refusal_msg,
+                context=prev_context or None,
                 scope_status='out_of_scope',
                 out_of_scope_reason=reason,
                 assessment_year=assessment_year_str,
@@ -347,12 +365,41 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                         if dv not in locations['districts']:
                             locations['districts'].append(dv)
 
-        # ── 7. Use best available intent ─────────────────────────────────────
+        # ── 7. Use best available intent + resolve context ───────────────────
         final_intent = parsed['intent']
         if rasa_intent and rasa_confidence > 0.6:
             final_intent = rasa_intent
 
-        logger.info(f"Intent: {final_intent} | Locations: {locations}")
+        crop_name = parsed.get('crop')
+        explicit_location_found = bool(locations['districts'] or locations['states'])
+        resolved_from_context = False
+        pending_clarification: Optional[Dict[str, Any]] = None
+
+        # If bot just asked for a location for a pending clarification and user supplied one
+        prev_pending = prev_context.get('pending_clarification')
+        if explicit_location_found and prev_pending and final_intent == 'ask_groundwater' and not crop_name:
+            final_intent = prev_pending.get('intent', final_intent)
+            crop_name = prev_pending.get('crop')
+
+        # Resolve location from context on follow-up references or contextual advisory intents
+        if not explicit_location_found:
+            should_use_context = parsed.get('uses_context') or final_intent in (
+                'ask_crop_water_requirements',
+                'ask_irrigation_impact',
+                'ask_sustainability',
+                'ask_trends_causes',
+            )
+            if should_use_context and (prev_context.get('last_district') or prev_context.get('last_state')):
+                if prev_context.get('last_district'):
+                    locations['districts'] = [prev_context['last_district']]
+                if prev_context.get('last_state'):
+                    locations['states'] = [prev_context['last_state']]
+                resolved_from_context = True
+
+        logger.info(
+            f"Intent: {final_intent} | Locations: {locations} | "
+            f"Crop: {crop_name} | FromCtx: {resolved_from_context}"
+        )
 
         # ── 8. Data retrieval + answer building ──────────────────────────────
         bot_response  = ""
@@ -362,19 +409,125 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
         cgwb_cat_info = None
         extra_allowed: List[float] = []
 
+        # Helper to resolve single district record or state stats for advisory intents
+        def _resolve_advisory_target():
+            d_rec = None
+            s_name = None
+            s_stats = None
+            if locations['districts']:
+                matched_dist = locations['districts'][0]
+                recs = crud.get_data_by_district(db, matched_dist)
+                if recs and locations['states']:
+                    filtered = [r for r in recs if r.state in locations['states']]
+                    if filtered:
+                        recs = filtered
+                if recs:
+                    d_rec = recs[0]
+                    s_name = d_rec.state
+            elif locations['states']:
+                s_name = locations['states'][0]
+                s_stats = crud.get_statistics(db, s_name)
+            return d_rec, s_name, s_stats
+
         # ── GREET ──
         if final_intent == 'greet':
             bot_response = (
-                "👋 Hello! I'm your **INGRES AI Assistant** — your verified groundwater data guide for India.\n\n"
+                "👋 Hello! I'm your **INGRES AI Assistant** — your verified groundwater & irrigation guide for India.\n\n"
                 "I can help you with:\n"
-                "- 🌧️ Rainfall data\n"
-                "- 📊 Groundwater extraction stages & CGWB categories\n"
-                "- ♻️ Groundwater recharge data\n"
-                "- 💦 Net groundwater availability\n"
-                "- 🔬 What-If analysis\n\n"
-                f"All data is from the INGRES/CGWB assessment ({assessment_year_str})."
+                "- 🌧️ Rainfall, recharge, extraction stages & CGWB categories\n"
+                "- 🌱 Crop water suitability & lower-water crop guidance\n"
+                "- 🚿 Irrigation pressure & groundwater sustainability\n"
+                "- 🔬 What-If & Diagnostic analysis\n\n"
+                f"All groundwater data is from the INGRES/CGWB assessment ({assessment_year_str})."
             )
-            suggestions = ['Karnataka', 'Mysore', 'Show all states', 'Punjab groundwater', 'Compare Karnataka and Maharashtra']
+            suggestions = ['What is the groundwater status of Mysuru?', 'Karnataka groundwater', 'Which crops require less water?', 'Show all states']
+
+        # ── AGRICULTURAL CROP SUITABILITY ──
+        elif final_intent == 'ask_agricultural_suitability':
+            d_rec, s_name, s_stats = _resolve_advisory_target()
+            if d_rec:
+                data_results = [d_rec]
+            adv = chat_advisor.build_agricultural_suitability_response(
+                crop=crop_name,
+                district_record=d_rec,
+                state_name=s_name,
+                state_stats=s_stats,
+            )
+            bot_response = adv['response']
+            suggestions = adv['suggestions']
+            extra_allowed.extend(adv['extra_allowed'])
+            cgwb_cat_info = adv['cgwb_cat']
+            pending_clarification = adv.get('pending_clarification')
+
+        # ── CROP WATER REQUIREMENTS ──
+        elif final_intent == 'ask_crop_water_requirements':
+            d_rec, _, _ = _resolve_advisory_target()
+            if d_rec:
+                data_results = [d_rec]
+            adv = chat_advisor.build_crop_water_requirements_response(
+                crop=crop_name,
+                district_record=d_rec,
+            )
+            bot_response = adv['response']
+            suggestions = adv['suggestions']
+            extra_allowed.extend(adv['extra_allowed'])
+            cgwb_cat_info = adv['cgwb_cat']
+
+        # ── IRRIGATION IMPACT ──
+        elif final_intent == 'ask_irrigation_impact':
+            d_rec, s_name, s_stats = _resolve_advisory_target()
+            if d_rec:
+                data_results = [d_rec]
+            adv = chat_advisor.build_irrigation_impact_response(
+                district_record=d_rec,
+                state_name=s_name,
+                state_stats=s_stats,
+            )
+            bot_response = adv['response']
+            suggestions = adv['suggestions']
+            extra_allowed.extend(adv['extra_allowed'])
+            cgwb_cat_info = adv['cgwb_cat']
+
+        # ── GROUNDWATER SUSTAINABILITY ──
+        elif final_intent == 'ask_sustainability':
+            d_rec, s_name, s_stats = _resolve_advisory_target()
+            if d_rec:
+                data_results = [d_rec]
+            adv = chat_advisor.build_sustainability_response(
+                district_record=d_rec,
+                state_name=s_name,
+                state_stats=s_stats,
+                crop=crop_name,
+            )
+            bot_response = adv['response']
+            suggestions = adv['suggestions']
+            extra_allowed.extend(adv['extra_allowed'])
+            cgwb_cat_info = adv['cgwb_cat']
+            pending_clarification = adv.get('pending_clarification')
+
+        # ── TRENDS & CAUSES ──
+        elif final_intent == 'ask_trends_causes':
+            d_rec, s_name, s_stats = _resolve_advisory_target()
+            if d_rec:
+                data_results = [d_rec]
+            adv = chat_advisor.build_trends_causes_response(
+                district_record=d_rec,
+                state_name=s_name,
+                state_stats=s_stats,
+            )
+            bot_response = adv['response']
+            suggestions = adv['suggestions']
+            extra_allowed.extend(adv['extra_allowed'])
+            cgwb_cat_info = adv['cgwb_cat']
+            pending_clarification = adv.get('pending_clarification')
+
+        # ── GENERAL GROUNDWATER GUIDE ──
+        elif final_intent == 'ask_general_groundwater':
+            adv = chat_advisor.build_general_groundwater_response(assessment_year_str)
+            bot_response = adv['response']
+            suggestions = adv['suggestions']
+            extra_allowed.extend(adv['extra_allowed'])
+            cgwb_cat_info = adv['cgwb_cat']
 
         # ── STATE LIST ──
         elif final_intent == 'ask_state_list':
@@ -383,11 +536,13 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
 
         # ── WHAT-IF ──
         elif final_intent == 'ask_whatif':
-            if locations['districts'] or locations['states']:
-                loc_name  = locations['districts'][0] if locations['districts'] else locations['states'][0]
-                is_district = bool(locations['districts'])
-                recs = (crud.get_data_by_district(db, loc_name) if is_district
-                        else crud.get_data_by_state(db, loc_name))
+            if locations['districts']:
+                loc_name = locations['districts'][0]
+                recs = crud.get_data_by_district(db, loc_name)
+                if recs and locations['states']:
+                    filtered = [r for r in recs if r.state in locations['states']]
+                    if filtered:
+                        recs = filtered
                 if recs:
                     r = recs[0]
                     if (
@@ -407,7 +562,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                             f"🏗️ Annual Extractable Resource: **{r.annual_extractable_gw_resource:.2f} ham**\n\n"
                             "To run a What-If simulation, please use the **🔬 What-If Analysis** tab "
                             "in the navigation, or specify a percentage change:\n"
-                            "*e.g., 'What if we reduce extraction by 20% in Karnataka?'*"
+                            "*e.g., 'What if we reduce extraction by 20% in Mysuru?'*"
                         )
                         data_results = [r]
                         cgwb_cat_info = classify_cgwb(r.stage_of_gw_extraction) if r.stage_of_gw_extraction is not None else None
@@ -422,12 +577,44 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                         f"⚠️ I couldn't find data for **{loc_name}** in the INGRES dataset. "
                         "Please use the What-If Analysis tab to select from available districts."
                     )
+                suggestions = ['Karnataka What-If', 'Punjab extraction', 'Show all states']
+            elif locations['states']:
+                loc_name = locations['states'][0]
+                recs = crud.get_data_by_state(db, loc_name)
+                stats = crud.get_statistics(db, loc_name)
+                districts_in_state = crud.get_districts_by_state(db, loc_name)
+                if recs and stats:
+                    total_ext = round(sum(r.gw_extraction for r in recs if r.gw_extraction is not None), 2)
+                    total_extable = round(sum(
+                        r.annual_extractable_gw_resource for r in recs
+                        if r.annual_extractable_gw_resource is not None
+                    ), 2)
+                    avg_stage = round(stats['avg_extraction_stage'], 2)
+                    extra_allowed.extend([avg_stage, total_ext, total_extable, len(recs)])
+                    data_results = recs
+                    cgwb_cat_info = classify_cgwb(avg_stage)
+                    sample_dists = ", ".join(d.title() for d in districts_in_state[:4])
+                    bot_response = (
+                        f"What-If simulations in INGRES operate at the **district level** rather than a single state-wide unit.\n\n"
+                        f"📍 **State Overview — {loc_name.title()}** ({len(recs)} districts):\n"
+                        f"- **Total GW Extraction (district sum):** **{total_ext:.2f} ham**\n"
+                        f"- **Total Extractable Resource (district sum):** **{total_extable:.2f} ham**\n"
+                        f"- **Average Extraction Stage:** **{avg_stage:.2f}%** ({cgwb_cat_info['emoji']} {cgwb_cat_info['category']})\n\n"
+                        f"Please select a district in **{loc_name.title()}** (e.g., {sample_dists}) or use the **🔬 What-If Analysis** tab to run a district simulation."
+                    )
+                    suggestions = [f"What if {d.title()} reduces extraction by 20%?" for d in districts_in_state[:4]]
+                else:
+                    bot_response = (
+                        f"⚠️ I couldn't find data for **{loc_name}** in the INGRES dataset. "
+                        "Please use the What-If Analysis tab to select from available districts."
+                    )
+                    suggestions = ['Karnataka What-If', 'Punjab extraction', 'Show all states']
             else:
                 bot_response = (
                     "Please use the **🔬 What-If Analysis** tab to select a state and district, "
                     "then enter a percentage change to simulate groundwater extraction scenarios."
                 )
-            suggestions = ['Karnataka What-If', 'Punjab extraction', 'Show all states']
+                suggestions = ['Karnataka What-If', 'Punjab extraction', 'Show all states']
 
         # ── COMPARE ──
         elif final_intent == 'compare':
@@ -460,7 +647,24 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
                             })
                 if comparison_data:
                     names = " vs ".join(c['name'].title() for c in comparison_data)
-                    bot_response = f"Here's the groundwater comparison: **{names}**"
+                    is_rainfall_cmp = any(
+                        w in search_text
+                        for w in ('rainfall', 'rain', 'precipitation', 'barish', 'वर्षा', 'बारिश')
+                    )
+                    if is_rainfall_cmp:
+                        rain_lines = []
+                        for c in comparison_data:
+                            extra_allowed.append(round(c['rainfall'], 2))
+                            scope_lbl = "State Avg" if c['type'] == 'State' else c.get('state', '').title()
+                            rain_lines.append(
+                                f"- 🌧️ **{c['name'].title()}** ({scope_lbl}): **{c['rainfall']:.2f} mm**"
+                            )
+                        bot_response = (
+                            f"Here's the **rainfall comparison** (**{names}**):\n\n"
+                            + "\n".join(rain_lines)
+                        )
+                    else:
+                        bot_response = f"Here's the groundwater comparison: **{names}**"
                     chart_data   = {'type': 'comparison', 'data': comparison_data}
                 else:
                     bot_response = "I found the locations but couldn't retrieve comparison data."
@@ -763,6 +967,54 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
             except Exception:
                 pass
 
+        # ── 11. Build updated conversation context & log history ─────────────
+        next_context: Dict[str, Any] = {
+            "last_intent": final_intent,
+            "pending_clarification": pending_clarification,
+        }
+        if explicit_location_found:
+            if locations['districts']:
+                resolved_dist = data_results[0].district if data_results else locations['districts'][0]
+                resolved_state = data_results[0].state if data_results else (locations['states'][0] if locations['states'] else None)
+                next_context["last_district"] = resolved_dist
+                next_context["last_state"] = resolved_state
+                next_context["last_location_type"] = "district"
+            elif locations['states']:
+                next_context["last_state"] = locations['states'][0]
+                next_context["last_district"] = None
+                next_context["last_location_type"] = "state"
+        else:
+            if prev_context.get("last_state"):
+                next_context["last_state"] = prev_context["last_state"]
+            if prev_context.get("last_district"):
+                next_context["last_district"] = prev_context["last_district"]
+            if prev_context.get("last_location_type"):
+                next_context["last_location_type"] = prev_context["last_location_type"]
+
+        # Preserve crop only across crop/sustainability follow-ups, clear on location-only lookup shifts
+        if crop_name:
+            next_context["last_crop"] = crop_name
+        elif final_intent in ('ask_sustainability', 'ask_crop_water_requirements') and prev_context.get("last_crop"):
+            next_context["last_crop"] = prev_context["last_crop"]
+        else:
+            next_context["last_crop"] = None
+
+        if message.session_id:
+            if len(_SESSION_CONTEXT) >= 500 and message.session_id not in _SESSION_CONTEXT:
+                oldest_key = next(iter(_SESSION_CONTEXT))
+                _SESSION_CONTEXT.pop(oldest_key, None)
+            _SESSION_CONTEXT[message.session_id] = next_context
+
+        try:
+            db.add(models.ChatHistory(
+                user_message=user_message,
+                bot_response=bot_response,
+                language=user_language,
+            ))
+            db.commit()
+        except Exception:
+            db.rollback()
+
         logger.info(f"Response (first 100): {bot_response[:100]}")
 
         return schemas.ChatResponse(
@@ -770,6 +1022,7 @@ async def chat(message: schemas.ChatMessage, db: Session = Depends(get_db)):
             data=formatted_data if formatted_data else None,
             suggestions=suggestions if suggestions else None,
             chart_data=chart_data,
+            context=next_context,
             # Review 2 fields
             verified=verified,
             verification_issues=v_issues if not verified else [],
