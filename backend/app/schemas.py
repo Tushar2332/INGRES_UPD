@@ -1,5 +1,6 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional, List, Dict, Any
+import math
 
 
 class GroundwaterDataSchema(BaseModel):
@@ -42,6 +43,23 @@ class WhatIfRequest(BaseModel):
     state: str
     district: str
     pct_change: float  # negative = reduction, positive = increase
+
+    @field_validator("state", "district")
+    @classmethod
+    def _non_empty_location(cls, v: str) -> str:
+        cleaned = (v or "").strip()
+        if not cleaned:
+            raise ValueError("State and district must be non-empty")
+        return cleaned
+
+    @field_validator("pct_change")
+    @classmethod
+    def _valid_pct_change(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("pct_change must be a finite number")
+        if v < -100.0 or v > 1000.0:
+            raise ValueError("pct_change must be between -100 and 1000")
+        return v
 
 
 class WhatIfResponse(BaseModel):

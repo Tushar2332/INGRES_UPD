@@ -3,21 +3,34 @@ import axios from 'axios';
 import ChatWindow from './components/ChatWindow';
 import Sidebar from './components/Sidebar';
 import WhatIfPanel from './components/WhatIfPanel';
+import DiagnosticPanel from './components/DiagnosticPanel';
 import './App.css';
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
 function App() {
-  const [language, setLanguage]       = useState('en');
-  const [states, setStates]           = useState([]);
-  const [selectedState, setSelectedState] = useState(null);
-  const [activeTab, setActiveTab]     = useState('chat'); // 'chat' | 'whatif'
+  const [language, setLanguage]                 = useState('en');
+  const [states, setStates]                     = useState([]);
+  const [selectedState, setSelectedState]       = useState(null);
+  const [activeTab, setActiveTab]               = useState('chat'); // 'chat' | 'whatif' | 'diagnostics'
+  const [diagnosticTarget, setDiagnosticTarget] = useState(null);
+  const [whatIfTarget, setWhatIfTarget]         = useState(null);
 
   useEffect(() => {
     axios.get(`${API_URL}/states`)
       .then(r => setStates(r.data))
       .catch(err => console.error('Error fetching states:', err));
   }, []);
+
+  const handleOpenDiagnostics = (state, district) => {
+    setDiagnosticTarget({ state, district, ts: Date.now() });
+    setActiveTab('diagnostics');
+  };
+
+  const handleOpenWhatIf = (state, district) => {
+    setWhatIfTarget({ state, district, ts: Date.now() });
+    setActiveTab('whatif');
+  };
 
   return (
     <div className="app-container">
@@ -46,6 +59,7 @@ function App() {
                 <span className="header-badge verified-badge">✓ Verified Answers</span>
                 <span className="header-badge scope-badge">🛡️ Scope-Aware</span>
                 <span className="header-badge whatif-badge">🔬 What-If Analysis</span>
+                <span className="header-badge diag-badge">🩺 Evidence Diagnostics</span>
               </div>
             </div>
           </div>
@@ -66,22 +80,40 @@ function App() {
             >
               🔬 What-If Analysis
             </button>
+            <button
+              id="tab-diagnostics"
+              className={`tab-btn ${activeTab === 'diagnostics' ? 'active' : ''}`}
+              onClick={() => setActiveTab('diagnostics')}
+            >
+              🩺 Diagnostics
+            </button>
           </nav>
         </header>
 
-        {/* Tab Content */}
+        {/* Tab Content (keep panes mounted to preserve state across tab switches) */}
         <div className="tab-content">
-          {activeTab === 'chat' && (
+          <div className={`tab-pane ${activeTab === 'chat' ? 'active' : 'hidden'}`}>
             <ChatWindow
               language={language}
               selectedState={selectedState}
             />
-          )}
-          {activeTab === 'whatif' && (
+          </div>
+          <div className={`tab-pane ${activeTab === 'whatif' ? 'active' : 'hidden'}`}>
             <div className="whatif-container">
-              <WhatIfPanel />
+              <WhatIfPanel
+                externalTarget={whatIfTarget}
+                onOpenDiagnostics={handleOpenDiagnostics}
+              />
             </div>
-          )}
+          </div>
+          <div className={`tab-pane ${activeTab === 'diagnostics' ? 'active' : 'hidden'}`}>
+            <div className="whatif-container">
+              <DiagnosticPanel
+                externalTarget={diagnosticTarget}
+                onOpenWhatIf={handleOpenWhatIf}
+              />
+            </div>
+          </div>
         </div>
       </div>
     </div>
