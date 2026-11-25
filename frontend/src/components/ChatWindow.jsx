@@ -5,22 +5,27 @@ import InputBar from './InputBar';
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
+const _makeSessionId = () =>
+  `sess_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
 const ChatWindow = ({ language, selectedState }) => {
+  const sessionIdRef = useRef(_makeSessionId());
+  const [chatContext, setChatContext] = useState(null);
   const [messages, setMessages] = useState([
     {
       type: 'bot',
-      text: "👋 Hello! I'm your **INGRES AI Assistant** — a Verified Groundwater Chatbot.\n\nAsk me about rainfall, extraction stages, CGWB categories, and groundwater data for any Indian state or district. 💧",
+      text: "👋 Hello! I'm your **INGRES AI Assistant** — a Verified Groundwater & Irrigation Decision-Support Chatbot.\n\nAsk me about rainfall, extraction stages, CGWB categories, crop water suitability, irrigation impact, or groundwater sustainability for any Indian state or district. 💧",
       timestamp: new Date().toLocaleTimeString(),
       suggestions: [
+        'What is the groundwater status of Mysuru?',
         'Karnataka groundwater',
-        'Mysore extraction stage',
+        'Which crops require less water?',
         'Show all states',
         'Compare Karnataka and Maharashtra',
-        'Rainfall in Rajasthan',
       ],
       verified: true,
-      assessmentYear: '2022',
-      dataSource: 'INGRES / CGWB (GEC-2022)',
+      assessmentYear: '2024-2025',
+      dataSource: 'INGRES / CGWB (GEC-2024-2025)',
       dataConfidence: 'Latest Available Assessment',
     }
   ]);
@@ -48,9 +53,14 @@ const ChatWindow = ({ language, selectedState }) => {
       const response = await axios.post(`${API_URL}/chat`, {
         message: text,
         language: language,
+        session_id: sessionIdRef.current,
+        context: chatContext,
       });
 
       const d = response.data;
+      if (d.context) {
+        setChatContext(d.context);
+      }
       const botMessage = {
         type:               'bot',
         text:               d.response,
@@ -84,7 +94,7 @@ const ChatWindow = ({ language, selectedState }) => {
     } finally {
       setIsTyping(false);
     }
-  }, [language]);
+  }, [language, chatContext]);
 
   useEffect(() => {
     if (selectedState) {

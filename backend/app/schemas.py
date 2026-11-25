@@ -20,6 +20,8 @@ class GroundwaterDataSchema(BaseModel):
 class ChatMessage(BaseModel):
     message: str
     language: str = "en"
+    session_id: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
 
 
 class ChatResponse(BaseModel):
@@ -27,6 +29,7 @@ class ChatResponse(BaseModel):
     data: Optional[List[dict]] = None
     suggestions: Optional[List[str]] = None
     chart_data: Optional[Dict[str, Any]] = None
+    context: Optional[Dict[str, Any]] = None
     # ── Review 2 additions ──────────────────────────────────────────────────
     verified: Optional[bool] = None
     verification_issues: Optional[List[str]] = None
